@@ -43,47 +43,55 @@ end
 
 -- Representations for table-represented types
 local function val_symbol(s)
-	return { tag = "symbol",
-		 symbol = s,
-		 size = math.ceil(#s / 10) + 15
+	return {
+		tag = "symbol",
+		symbol = s,
+		size = #s + 16,
 	}
 end
 
 local function val_char(c)
-	return { tag = "char",
-		 char = c,
-		 size = 15,
+	return {
+		tag = "char",
+		char = c,
+		size = 15,
 	}
 end
 
 -- "Compiled" pairs. Takes two sexps rather than addresses. This is used in the
 -- internal representation of expressions.
 local function val_compair(exp1, exp2)
-	return { tag = "compair",
-		 car = exp1,
-		 cdr = exp2,
-		 size = 16 + size_of_val(exp1) + size_of_val(exp2)
+	return {
+		tag = "compair",
+		car = exp1,
+		cdr = exp2,
+		size = 16 + size_of_val(exp1) + size_of_val(exp2),
 	}
 end
 
 -- Takes the address of the car and cdr
 local function val_pair(addr1, addr2)
-	return { tag = "pair",
-		 car = addr1,
-		 cdr = addr2,
-		 size = 18,
+	return {
+		tag = "pair",
+		car = addr1,
+		cdr = addr2,
+		size = 18,
 	}
 end
 
 -- Takes a list (table) of addresses
 local function val_vector(addrs)
-	return { tag = "vector",
-		 elements = addrs,
-		 size = 18 + #addrs * 2
+	return {
+		tag = "vector",
+		elements = addrs,
+		size = 18 + #addrs * 2,
 	}
 end
 
-local the_empty = { tag = "empty", size = 13 }
+local the_empty = {
+	tag = "empty",
+	size = 13,
+}
 
 local function val_empty()
 	return the_empty
@@ -474,6 +482,10 @@ function parse_exp(str, start_i)
 		end
 	end
 
+	if res == tok_vecstart or res == tok_bytevecstart then
+		return "(Byte)Vector literals unsupported"
+	end
+	
 	return nil, "Unsupported token"
 end
 
@@ -554,7 +566,6 @@ end
 
 local function render_symbol(symbol)
 	local symname = symbol.symbol
-	print(lpeg.match(ordinary_symbol, symname))
 	if lpeg.match(ordinary_symbol, symname) then
 		return symname
 	else
@@ -640,6 +651,8 @@ local function parse_test_loop()
 
 	parse_test_loop()
 end
+
+
 
 -- Export for debugging
 vm.parsers = {}
