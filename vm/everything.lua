@@ -10,11 +10,20 @@ local vm = {}
 --   Number => Lua Number
 --   Boolean => Lua Boolean
 --   Pair => val_pair
+--   "Compiled Pair" => val_compair
 --   Symbol => val_symbol
 --   Character => val_char
 --   String => Lua String
 --   Vector => val_vector
 --   Empty List => val_empty
+
+-- ** Size standards (Lua types) **
+--  Number: 2
+--  Boolean: 1
+--  String: length + 1
+--  Table: 3 + number of keys + sum of the sizes of its values
+
+local ceil = math.ceil
 
 -- Don't give it userdata or threads.
 -- Sizes are used in calculating memory use and estimating computational cost.
@@ -26,7 +35,7 @@ local function size_of_val(val)
 	elseif v_type == "boolean" then
 		return 1
 	elseif v_type == "string" then
-		return math.ceil(#val / 10)
+		return #val
 	else -- v_type == "table"
 		return val.size
 	end
@@ -36,23 +45,24 @@ end
 local function val_symbol(s)
 	return { tag = "symbol",
 		 symbol = s,
-		 size = math.ceil(#s / 10) + 5
+		 size = math.ceil(#s / 10) + 15
 	}
 end
 
 local function val_char(c)
 	return { tag = "char",
 		 char = c,
-		 size = 6,
+		 size = 15,
 	}
 end
 
--- "Compiled" pairs. Takes two sexps rather than addresses.
+-- "Compiled" pairs. Takes two sexps rather than addresses. This is used in the
+-- internal representation of expressions.
 local function val_compair(exp1, exp2)
 	return { tag = "compair",
 		 car = exp1,
 		 cdr = exp2,
-		 size = 7 + size_of_val(exp1) + size_of_val(exp2)
+		 size = 16 + size_of_val(exp1) + size_of_val(exp2)
 	}
 end
 
@@ -61,7 +71,7 @@ local function val_pair(addr1, addr2)
 	return { tag = "pair",
 		 car = addr1,
 		 cdr = addr2,
-		 size = 7,
+		 size = 18,
 	}
 end
 
@@ -69,11 +79,11 @@ end
 local function val_vector(addrs)
 	return { tag = "vector",
 		 elements = addrs,
-		 size = 10 + math.ceil(#addrs / 5)
+		 size = 18 + #addrs * 2
 	}
 end
 
-local the_empty = { tag = "empty", size = 5 }
+local the_empty = { tag = "empty", size = 13 }
 
 local function val_empty()
 	return the_empty
@@ -91,15 +101,15 @@ local tok_unquote_splice = {}
 local tok_dot = {}
 
 local unvalue_toks = {
-	tok_lparen = true,
-	tok_rparen = true,
-	tok_vecstart = true,
-	tok_bytevecstart = true,
-	tok_quote = true,
-	tok_backquote = true,
-	tok_unquote = true,
-	tok_unquote_splice = true,
-	tok_dot = true
+	[tok_lparen] = "lparen",
+	[tok_rparen] = "rparen",
+	[tok_vecstart] = "vecstart",
+	[tok_bytevecstart] = "bytevecstart",
+	[tok_quote] = "quote",
+	[tok_backquote] = "backquote",
+	[tok_unquote] = "unquote",
+	[tok_unquote_splice] = "unquote-splice",
+	[tok_dot] = "dot",
 }
 
 local function is_value_tok(tok)
@@ -134,6 +144,14 @@ local mnemonic_mapping = {
 	["\\t"] = "\t",
 	["\\n"] = "\n",
 	["\\r"] = "\r",
+}
+
+local mnemonic_mapping_rev = {
+	["\a"] = "\\a",
+	["\b"] = "\\b",
+	["\t"] = "\\t",
+	["\n"] = "\\n",
+	["\r"] = "\\r",
 }
 
 local mnemonic_escape =
@@ -181,7 +199,7 @@ local char_name = P("alarm") * Cc("\a")
 	+ P("space") * Cc(" ")
 	+ P("tab") * Cc("\t")
 
-local char_body = inline_hex_escape + P("\\") * (char_name + P(1))
+local char_body = P("\\") * (char_name + C(P(1))) + inline_hex_escape
 
 -- Captures a character value
 local char = P("#") * char_body / val_char
@@ -284,8 +302,8 @@ local number = num(2) + num(8) + num(10) + num(16)
 
 local token = identifier
 	+ boolean
-	+ number
 	+ char
+	+ number
 	+ string_v
 	+ P("(") * Cc(tok_lparen)
 	+ P(")") * Cc(tok_rparen)
@@ -340,48 +358,62 @@ local prefixers = {
 	[tok_unquote_splice] = { unquote_splice_symb, ",@" },
 }
 
--- Returns next position and exp on success, otherwise returns nil and an error
--- message. On safely reach eof, returns -1.
--- This can produce improper lists, though never infinite ones.
-local function parse_exp(str, start_i, in_combo)
+local parse_exp
+
+-- Can never report eof
+local function parse_list(str, start_i)
 	local next_i, res = lex(str, start_i)
 
 	if next_i == -1 then
-		return -1
+		return nil, "Unclosed parenthesis"
 	elseif not next_i then
-		return nil, "Bad token near: " .. re
+		return nil, "Bad token near: " .. res
 	elseif is_value_tok(res) then
-		return next_i, res
-	elseif res == tok_lparen then
-		return parse_exp(str, next_i, true)
-	elseif res == tok_rparen then
-		if in_combo then
-			return next_i, the_empty
-		else
-			return nil, "Unmatched closing parenthesis"
-		end
-	elseif res == tok_dot then
-		if in_combo then
-			-- If we are in a list and there is a dot, there needs
-			-- to be exactly one expression after it before the list
-			-- ends.
-			local next_next_i, next_res = parse_exp(str, next_i)
-			if not next_next_i then
-				return nil, "Ill-formed dotted list"
-			end
+		local next_next_i, tail = parse_list(str, next_i)
 
+		if not next_next_i then 
+			return nil, tail
+		else
+			return next_next_i, val_compair(res, tail)
+		end
+	elseif res == tok_lparen then
+		local next_next_i, head = parse_list(str, next_i)
+
+		if not next_next_i then
+			return nil, head
+		else
+			local next_3_i, tail = parse_list(str, next_next_i)
+
+			if not next_3_i then
+				return nil, tail
+			else
+				return next_3_i, val_compair(head, tail)
+			end
+		end
+	elseif res == tok_rparen then
+		return next_i, the_empty
+	elseif res == tok_dot then
+		-- Next expression will be the tail
+		local next_next_i, tail = parse_exp(str, next_i)
+
+		if not next_next_i then
+			return nil, "Ill-formed dotted list"
+		elseif next_next_i == -1 then
+			return nil, "Unclosed parenthesis"
+		else
 			local next_3_i, next_2_res = lex(str, next_next_i)
+
 			if not next_3_i then
 				return nil, "Bad token near: " .. next_2_res
+			elseif next_3_i == -1 then
+				return nil, "Unclosed parenthesis"
 			elseif next_2_res == tok_rparen then
-				-- The list finished properly.
-				return next_res
+				-- List finished properly
+				return next_3_i, tail
 			else
-				-- Too much stuff after dot.
+				-- Too much stuff after dot
 				return nil, "Ill-formed dotted list"
 			end
-		else
-			return nil, "Free dot"
 		end
 	end
 
@@ -390,18 +422,65 @@ local function parse_exp(str, start_i, in_combo)
 	if prefixer then
 		local next_next_i, next_res = parse_exp(str, next_i)
 		if not next_next_i then
+			return nil, next_res
+		elseif next_next_i == -1 then
+			return nil, prefixer[2] .. " must prefix an expression."
+		else 
+			local head = val_compair(prefixer[1],
+					val_compair(next_res, the_empty))
+
+			local next_3_i, tail = parse_list(str, next_next_i)
+
+			if not next_3_i then
+				return nil, tail
+			else
+				return next_3_i, val_compair(head, tail)
+			end
+		end
+	end
+end
+
+-- Returns next position and exp on success, otherwise returns nil and an error
+-- message. On safely reach eof, returns -1.
+-- This can produce improper lists, though never infinite ones.
+function parse_exp(str, start_i)
+	local next_i, res = lex(str, start_i)
+
+	if next_i == -1 then
+		return -1
+	elseif not next_i then
+		return nil, "Bad token near: " .. res
+	elseif is_value_tok(res) then
+		return next_i, res
+	elseif res == tok_lparen then
+		return parse_list(str, next_i)
+	elseif res == tok_rparen then
+		return nil, "Unmatched closing parenthesis"
+	elseif res == tok_dot then
+		return nil, "Free dot"
+	end
+
+	local prefixer = prefixers[res]
+
+	if prefixer then
+		local next_next_i, next_res = parse_exp(str, next_i)
+		if not next_next_i then
+			return nil, next_res
+		elseif next_next_i == -1 then
 			return nil, prefixer[2] .. " must prefix an expression."
 		else
-			return val_compair(prefixer[1],
+			return next_next_i, val_compair(prefixer[1],
 				val_compair(next_res, the_empty))
 		end
 	end
+
+	return nil, "Unsupported token"
 end
 
 local plus_inf = 1/0
 local neg_inf = -1/0
 
-local render_sexp
+local render_exp
 
 local function render_number(num)
 	if num ~= num then -- it is nan
@@ -428,31 +507,139 @@ end
 local function render_pair_helper(exp, acctable, idx)
 	if type(exp) == "table" then
 		if exp.tag == "compair" then
-			acctable[idx] = render_sexp(exp.car)
+			acctable[idx] = render_exp(exp.car)
 			render_pair_helper(exp.cdr, acctable, idx + 1)
-		-- elseif exp ~= the_empty then add nothing
-		else -- Some other kind of expression, so improper tail
+		elseif exp ~= the_empty then -- Improper tail
 			acctable[idx] = "."
-			acctable[idx + 1] = render_sexp(exp.cdr)
-		end
+			acctable[idx + 1] = render_exp(exp.cdr)
+		end -- else don't need to do anything for empty
 	else -- Same as the above case
 		acctable[idx] = "."
-		acctable[idx + 1] = render_sexp(exp.cdr)
+		acctable[idx + 1] = render_exp(exp)
 	end
 end
 
 local function render_pair(pair)
 	local concat_this = {}
-	concat_this[1] = render_sexp(pair.car)
+	concat_this[1] = render_exp(pair.car)
 	render_pair_helper(pair.cdr, concat_this, 2)
 
 	return "(" .. table.concat(concat_this, " ") .. ")"
 end
 
-local function render_symbol(symbol)
-	
+-- One that can be constructed without |
+local ordinary_symbol = (initial * subsequent^0 + peculiar_identifier) * P(-1)
+
+local function escape_char(str)
+	if mnemonic_mapping_rev[str] then
+		return mnemonic_mapping_rev[str]
+	else
+		return "\\x" .. string.format("%x", string.byte(str))
+	end
 end
 
+local function escape_ident_char(str)
+	if mnemonic_mapping_rev[str] then
+		return mnemonic_mapping_rev[str]
+	elseif str == "|" then
+		return "\\|"
+	else
+		return "\\x" .. string.format("%x", string.byte(str))
+	end
+end
+
+local function escape_ident(str)
+	return string.gsub(str, "[%c|]", escape_ident_char)
+end
+
+local function render_symbol(symbol)
+	local symname = symbol.symbol
+	print(lpeg.match(ordinary_symbol, symname))
+	if lpeg.match(ordinary_symbol, symname) then
+		return symname
+	else
+		return "|" .. escape_ident(symname) .. "|"
+	end
+end
+
+local char_escapes = {
+	["\a"] = "alarm",
+	["\b"] = "backspace",
+	["\127"] = "delete",
+	["\027"] = "escape",
+	["\n"] = "newline",
+	["\000"] = "null",
+	["\r"] = "return",
+	[" "] = "space",
+	["\t"] = "tab",
+}
+
+local function render_char(char)
+	local char_str = char.char
+
+	if char_escapes[char_str] then
+		return "#\\" .. char_escapes[char_str]
+	elseif string.find(char_str, "%c") then
+		return "#\\x" .. string.format("%x", string.byte(char_str))
+	else
+		return "#\\" .. char_str
+	end
+end
+
+local function render_string(str)
+	return "\"" .. string.gsub(str, "%c", escape_char) .. "\""
+end
+
+local function render_empty(the_empty)
+	return "()"
+end
+
+function render_exp(exp)
+	local e_type = type(exp)
+
+	if e_type == "table" then
+		local tag = exp.tag
+
+		if tag == "compair" then
+			return render_pair(exp)
+		elseif tag == "symbol" then
+			return render_symbol(exp)
+		elseif tag == "char" then
+			return render_char(exp)
+		elseif tag == "empty" then
+			return render_empty(exp)
+		else
+			error("Bad expression type: " .. tag)
+		end
+	elseif e_type == "number" then
+		return render_number(exp)
+	elseif e_type == "boolean" then
+		return render_boolean(exp)
+	elseif e_type == "string" then
+		return render_string(exp)
+	end
+end
+
+local function parse_test_loop()
+	print("Exp?")
+	local input = io.read("*line")
+
+	if input == "***quit***" then return end
+
+	local next_i = 1
+
+	while next_i ~= nil and next_i >= 0 do
+		next_i, res = parse_exp(input, next_i)
+
+		if not next_i then
+			print("Bad input: " .. res)
+		elseif next_i ~= -1 then
+			print(render_exp(res))
+		end -- Don't do anything if finished
+	end
+
+	parse_test_loop()
+end
 
 -- Export for debugging
 vm.parsers = {}
@@ -462,5 +649,6 @@ vm.parsers.symbol = identifier * P(-1)
 vm.parsers.char = char * P(-1)
 vm.parsers.boolean = boolean * P(-1)
 vm.lex = lex
+vm.parse_test_loop = parse_test_loop
 
 return vm
